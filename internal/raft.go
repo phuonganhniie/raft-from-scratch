@@ -35,6 +35,11 @@ func (s CMState) String() string {
 	}
 }
 
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
 type ConsensusModule struct {
 	// mu handles race condition when concurrent occurs
 	mu sync.Mutex
@@ -50,6 +55,8 @@ type ConsensusModule struct {
 
 	// Persistent Raft state on all servers
 	currentTerm int
+	votedFor    int
+	log         []LogEntry
 
 	// Volatile Raft state on all servers
 	state              CMState
@@ -117,3 +124,78 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 }
 
 // -------------- STAGE 2: Becoming a candidate --------------
+
+type RequestVoteArgs struct {
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate's last log entry
+	LastLogTerm  int // index of candidate's last log entry
+}
+
+type RequestVoteReply struct {
+	Term        int  // current term, for candidate to update itself
+	VoteGranted bool // true means candidate receives vote
+}
+
+// startElection starts new election with this CM as a candidate after election timer timeout.
+// Expect cm.mu to be locked.
+func (cm *ConsensusModule) startElection() {
+	cm.state = Candidate
+	cm.currentTerm++ // increase current term
+	savedCurrentTerm := cm.currentTerm
+	cm.electionResetEvent = time.Now() // reset election timer
+	cm.dlog("election reset event at: %v", cm.electionResetEvent)
+	cm.votedFor = cm.id
+	cm.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+
+	votesReceived := 1 // vote for self
+
+	// send RequestVote RPCs to all other servers
+	for _, peerId := range cm.peerIds {
+		go func(peerId int) {
+			requestVote := RequestVoteArgs{
+				Term:        savedCurrentTerm,
+				CandidateId: cm.id,
+			}
+
+			var reply RequestVoteReply
+			cm.dlog("sending RequestVote to %d: %+v", peerId, requestVote)
+
+			err := cm.server.CallRPC(peerId, "ConsensusModule.RequestVote", requestVote, reply)
+			if err != nil {
+				return
+			}
+
+			cm.mu.Lock()
+			defer cm.mu.Unlock()
+			cm.dlog("received RequestVote %+v", reply)
+
+			if cm.state != Candidate {
+				cm.dlog("while waiting for reply, state = %v", cm.state)
+				return
+			}
+
+			// set CM state to follower if reply term gt saved term in this goroutine
+			if reply.Term > savedCurrentTerm {
+				cm.dlog("term out of date in RequestVoteReply")
+				cm.becomeFollower(reply.Term)
+				return
+			}
+
+			if reply.Term == savedCurrentTerm {
+				if reply.VoteGranted {
+					votesReceived++
+					if votesReceived*2 > len(cm.peerIds)+1 {
+						// won the election
+						cm.dlog("win the election with %d votes", votesReceived)
+						cm.becomeLeader()
+						return
+					}
+				}
+			}
+		}(peerId)
+	}
+
+	// Run another election timer, in case this election not successful
+	go cm.runElectionTimer()
+}
