@@ -137,7 +137,8 @@ type RequestVoteReply struct {
 	VoteGranted bool // true means candidate receives vote
 }
 
-// startElection starts new election with this CM as a candidate after election timer timeout.
+// startElection starts new election with this CM as a candidate after election timer timeout,
+// now this CM become a candidate.
 // Expect cm.mu to be locked.
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
@@ -154,7 +155,8 @@ func (cm *ConsensusModule) startElection() {
 	for _, peerId := range cm.peerIds {
 		go func(peerId int) {
 			requestVote := RequestVoteArgs{
-				Term:        savedCurrentTerm,
+				// Term:        savedCurrentTerm,
+				Term:        cm.currentTerm,
 				CandidateId: cm.id,
 			}
 
@@ -197,5 +199,95 @@ func (cm *ConsensusModule) startElection() {
 	}
 
 	// Run another election timer, in case this election not successful
+	go cm.runElectionTimer()
+}
+
+// -------------- STAGE 3: Becoming a leader --------------
+type AppendEntries struct {
+	Term         int        // leader's term
+	LeaderId     int        // leader id
+	PrevLogIndex int        // index of log entry immediately preceding new ones
+	PrevLogTerm  int        // term of prevLogIndex entry
+	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int        // leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // current term, for leader to update itself
+	Success bool // true - if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+// becomeLeader switches cm into a leader state and begins process of heartbeats.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) becomeLeader() {
+	cm.state = Leader
+	cm.dlog("becomes leader; term = %d, log = %v", cm.currentTerm, cm.log)
+
+	// goroutine that send heartbeat every 50ms by using ticker
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		// send periodic heartbeats, as long as still leader
+		for {
+			cm.leaderSendHeartbeats()
+			<-ticker.C
+
+			cm.mu.Lock()
+			if cm.state != Leader {
+				cm.mu.Unlock()
+				return
+			}
+			cm.mu.Unlock()
+		}
+	}()
+}
+
+// leaderSendHeartbeats sends a round of heartbeats to ALL PEERS,
+// collect their replies and adjust cm's state
+func (cm *ConsensusModule) leaderSendHeartbeats() {
+	cm.mu.Lock()
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return
+	}
+	savedCurrentTerm := cm.currentTerm
+	cm.mu.Unlock()
+
+	for _, peerId := range cm.peerIds {
+		appendEntriesArgs := AppendEntries{
+			Term:     savedCurrentTerm,
+			LeaderId: cm.id,
+		}
+		go func(peerId int) {
+			cm.dlog("sending AppendEntries to %v: ni = %d, args = %+v", peerId, 0, appendEntriesArgs)
+
+			var reply AppendEntriesReply
+			err := cm.server.CallRPC(peerId, "ConsensusModule.AppendEntries", appendEntriesArgs, &reply)
+			if err != nil {
+				return
+			}
+
+			cm.mu.Lock()
+			defer cm.mu.Unlock()
+			if reply.Term > savedCurrentTerm {
+				cm.dlog("term out of date in heartbeat reply")
+				cm.becomeFollower(reply.Term)
+				return
+			}
+		}(peerId)
+	}
+}
+
+// becomeFollower makes cm become to follower and resets its state.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) becomeFollower(term int) {
+	cm.dlog("becomes Follower with term = %d; log = %v", term, cm.log)
+	cm.state = Follower
+	cm.currentTerm = term
+	cm.votedFor = -1
+	cm.electionResetEvent = time.Now()
+
+	// start new election timer
 	go cm.runElectionTimer()
 }
