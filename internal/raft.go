@@ -54,9 +54,9 @@ type ConsensusModule struct {
 	server *Server
 
 	// Persistent Raft state on all servers
-	currentTerm int
-	votedFor    int
-	log         []LogEntry
+	currentTerm int        // latest term server has seen
+	votedFor    int        // candidateId that received vote in current term
+	log         []LogEntry // log entries
 
 	// Volatile Raft state on all servers
 	state              CMState
@@ -183,7 +183,6 @@ func (cm *ConsensusModule) startElection() {
 				cm.becomeFollower(reply.Term)
 				return
 			}
-
 			if reply.Term == savedCurrentTerm {
 				if reply.VoteGranted {
 					votesReceived++
@@ -290,4 +289,62 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 
 	// start new election timer
 	go cm.runElectionTimer()
+}
+
+// -------------- STAGE 4: Answering RPCs --------------
+
+// RequestVote RPC. Invoked by candidates to gather votes.
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	if args.Term == cm.currentTerm && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+
+	reply.Term = cm.currentTerm
+	cm.dlog("... RequestVote reply: %+v", reply)
+	return nil
+}
+
+// AppendEntries RPC. Invoked by leader to replicate log entries; also used as heartbeat.
+func (cm *ConsensusModule) AppendEntries(args AppendEntries, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("AppendEntries: %+v", args)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in AppendEntries")
+		cm.becomeFollower(args.Term)
+	}
+
+	reply.Success = false
+	if args.Term == cm.currentTerm {
+		if cm.state != Follower {
+			cm.becomeFollower(args.Term)
+		}
+		cm.electionResetEvent = time.Now()
+		reply.Success = true
+	}
+
+	reply.Term = cm.currentTerm
+	cm.dlog("AppendEntries reply: %+v", *reply)
+	return nil
 }
